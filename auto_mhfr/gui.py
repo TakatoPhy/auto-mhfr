@@ -1,8 +1,10 @@
 """GUI for Auto-MHFR Analyzer & Lock."""
 
 import sys
+import time
 import threading
 import logging
+from collections import deque
 from typing import Optional
 
 from PyQt5.QtWidgets import (
@@ -124,6 +126,223 @@ class ScanPlotWidget(FigureCanvas):
         ax.grid(True, alpha=0.3)
         self.fig.tight_layout()
         self.draw()
+
+
+# ---------------------------------------------------------------------------
+# Real-time frequency monitor
+# ---------------------------------------------------------------------------
+
+class FrequencyDisplay(QWidget):
+    """Large LCD-style frequency display for one channel."""
+
+    def __init__(self, ch_cfg: ChannelConfig, parent=None):
+        super().__init__(parent)
+        self.ch_cfg = ch_cfg
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+
+        # Channel name
+        name_label = QLabel(self.ch_cfg.name)
+        name_label.setFont(QFont("sans-serif", 12, QFont.Bold))
+        name_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(name_label)
+
+        # Big frequency number
+        self.freq_label = QLabel("--- THz")
+        self.freq_label.setFont(QFont("monospace", 28, QFont.Bold))
+        self.freq_label.setAlignment(Qt.AlignCenter)
+        self.freq_label.setStyleSheet("color: #ecf0f1;")
+        layout.addWidget(self.freq_label)
+
+        # Error from target
+        self.error_label = QLabel("")
+        self.error_label.setFont(QFont("monospace", 16))
+        self.error_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.error_label)
+
+        # Target reference
+        target_label = QLabel(f"Target: {self.ch_cfg.target_freq_THz:.6f} THz")
+        target_label.setFont(QFont("monospace", 9))
+        target_label.setAlignment(Qt.AlignCenter)
+        target_label.setStyleSheet("color: #95a5a6;")
+        layout.addWidget(target_label)
+
+        self.setStyleSheet(
+            "FrequencyDisplay { background-color: #2c3e50; border-radius: 8px; }"
+        )
+
+    def update_reading(self, freq_THz: float):
+        self.freq_label.setText(f"{freq_THz:.6f} THz")
+        if self.ch_cfg.target_freq_THz > 0:
+            error_MHz = (freq_THz - self.ch_cfg.target_freq_THz) * 1e6
+            self.error_label.setText(f"{error_MHz:+.1f} MHz")
+            if abs(error_MHz) < 10:
+                self.error_label.setStyleSheet("color: #2ecc71; font-weight: bold;")
+            elif abs(error_MHz) < 100:
+                self.error_label.setStyleSheet("color: #f1c40f; font-weight: bold;")
+            else:
+                self.error_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+
+    def set_offline(self):
+        self.freq_label.setText("--- THz")
+        self.error_label.setText("")
+        self.error_label.setStyleSheet("")
+
+
+class MonitorWidget(QWidget):
+    """Real-time frequency monitor with strip chart for all channels."""
+
+    HISTORY_SECONDS = 300  # 5 minutes of history
+
+    def __init__(self, config: SystemConfig, wavemeter, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.wm = wavemeter
+        self._displays: dict[str, FrequencyDisplay] = {}
+        self._history: dict[str, deque] = {}
+        self._time_history: dict[str, deque] = {}
+        self._t0 = time.time()
+        self._running = False
+
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Frequency displays in a row
+        displays_layout = QHBoxLayout()
+        for ch_cfg in self.config.channels:
+            display = FrequencyDisplay(ch_cfg)
+            self._displays[ch_cfg.name] = display
+            displays_layout.addWidget(display)
+            # History buffer: max 5 min at ~10Hz = 3000 points
+            self._history[ch_cfg.name] = deque(maxlen=3000)
+            self._time_history[ch_cfg.name] = deque(maxlen=3000)
+        layout.addLayout(displays_layout)
+
+        # Strip chart
+        self.fig = Figure(figsize=(10, 4))
+        self.fig.patch.set_facecolor("#1e1e1e")
+        self.canvas = FigureCanvas(self.fig)
+        layout.addWidget(self.canvas)
+
+        # Controls row
+        ctrl_layout = QHBoxLayout()
+        self.btn_monitor = QPushButton("START MONITOR")
+        self.btn_monitor.setFont(QFont("sans-serif", 11, QFont.Bold))
+        self.btn_monitor.setMinimumHeight(36)
+        self.btn_monitor.setStyleSheet("background-color: #16a085; color: white;")
+        self.btn_monitor.clicked.connect(self._toggle_monitor)
+        ctrl_layout.addWidget(self.btn_monitor)
+
+        self.lbl_rate = QLabel("Update: --")
+        self.lbl_rate.setFont(QFont("monospace", 9))
+        ctrl_layout.addWidget(self.lbl_rate)
+        ctrl_layout.addStretch()
+        layout.addLayout(ctrl_layout)
+
+        # Timer for polling
+        self._timer = QTimer()
+        self._timer.timeout.connect(self._poll)
+
+        # Timer for chart redraw (slower)
+        self._chart_timer = QTimer()
+        self._chart_timer.timeout.connect(self._redraw_chart)
+
+    def _toggle_monitor(self):
+        if self._running:
+            self._stop_monitor()
+        else:
+            self._start_monitor()
+
+    def _start_monitor(self):
+        self._running = True
+        self._t0 = time.time()
+        for name in self._history:
+            self._history[name].clear()
+            self._time_history[name].clear()
+        self.btn_monitor.setText("STOP MONITOR")
+        self.btn_monitor.setStyleSheet("background-color: #c0392b; color: white;")
+        self._timer.start(100)  # 10 Hz polling
+        self._chart_timer.start(1000)  # 1 Hz chart update
+
+    def _stop_monitor(self):
+        self._running = False
+        self._timer.stop()
+        self._chart_timer.stop()
+        self.btn_monitor.setText("START MONITOR")
+        self.btn_monitor.setStyleSheet("background-color: #16a085; color: white;")
+        self.lbl_rate.setText("Update: stopped")
+        for display in self._displays.values():
+            display.set_offline()
+
+    def _poll(self):
+        """Read wavemeter and update displays."""
+        now = time.time()
+        for ch_cfg in self.config.channels:
+            name = ch_cfg.name
+            try:
+                freq = self.wm.get_frequency_THz(ch_cfg.wavemeter_channel)
+                if freq > 0:
+                    self._displays[name].update_reading(freq)
+                    t_rel = now - self._t0
+                    self._history[name].append(freq)
+                    self._time_history[name].append(t_rel)
+            except Exception:
+                pass
+        elapsed = time.time() - now
+        self.lbl_rate.setText(f"Update: {elapsed*1000:.0f} ms")
+
+    def _redraw_chart(self):
+        """Redraw the strip chart with frequency error history."""
+        self.fig.clear()
+
+        n_channels = len(self.config.channels)
+        if n_channels == 0:
+            return
+
+        colors = ["#3498db", "#e74c3c", "#2ecc71", "#f39c12",
+                  "#9b59b6", "#1abc9c", "#e67e22", "#ecf0f1"]
+
+        # Single plot with all channels (error in MHz)
+        ax = self.fig.add_subplot(111)
+        ax.set_facecolor("#1e1e1e")
+        ax.tick_params(colors="#95a5a6")
+        ax.xaxis.label.set_color("#95a5a6")
+        ax.yaxis.label.set_color("#95a5a6")
+        for spine in ax.spines.values():
+            spine.set_color("#444444")
+
+        has_data = False
+        for i, ch_cfg in enumerate(self.config.channels):
+            name = ch_cfg.name
+            times = list(self._time_history[name])
+            freqs = list(self._history[name])
+            if not times:
+                continue
+            has_data = True
+            errors_MHz = [(f - ch_cfg.target_freq_THz) * 1e6 for f in freqs]
+            color = colors[i % len(colors)]
+            ax.plot(times, errors_MHz, "-", color=color, linewidth=1.2,
+                    label=f"{name}", alpha=0.9)
+
+        if has_data:
+            ax.axhline(0, color="#444444", linestyle="--", linewidth=0.8)
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Error (MHz)")
+            ax.legend(fontsize=9, facecolor="#2c3e50", edgecolor="#444444",
+                      labelcolor="#ecf0f1", loc="upper right")
+            ax.grid(True, alpha=0.2, color="#444444")
+
+        self.fig.tight_layout()
+        self.canvas.draw()
+
+    def stop(self):
+        """Clean shutdown."""
+        self._stop_monitor()
 
 
 # ---------------------------------------------------------------------------
@@ -323,14 +542,20 @@ class MainWindow(QMainWindow):
         ch_layout.addStretch()
         splitter.addWidget(ch_widget)
 
-        # Plot tabs (one per channel)
-        self.plot_tabs = QTabWidget()
+        # Right side tabs: Monitor + Scan plots
+        self.right_tabs = QTabWidget()
+
+        # Monitor tab (first = default visible)
+        self.monitor = MonitorWidget(self.config, self.wm)
+        self.right_tabs.addTab(self.monitor, "Monitor")
+
+        # Scan plot tabs
         self.plots: dict[str, ScanPlotWidget] = {}
         for ch_cfg in self.config.channels:
             plot = ScanPlotWidget()
             self.plots[ch_cfg.name] = plot
-            self.plot_tabs.addTab(plot, ch_cfg.name)
-        splitter.addWidget(self.plot_tabs)
+            self.right_tabs.addTab(plot, f"Scan: {ch_cfg.name}")
+        splitter.addWidget(self.right_tabs)
 
         splitter.setSizes([300, 700])
         main_layout.addWidget(splitter)
@@ -555,6 +780,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._stop_event.set()
+        self.monitor.stop()
         event.accept()
 
 
