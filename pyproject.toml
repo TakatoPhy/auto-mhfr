@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "auto-mhfr"
+version = "0.1.0"
+description = "Automatic mode-hop-free region analyzer and frequency lock for IF-ECDL lasers"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "TakatoPhy"},
+]
+keywords = ["laser", "ECDL", "wavemeter", "frequency-stabilization", "mode-hop", "atomic-physics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+gui = ["PyQt5", "matplotlib"]
+nidaq = ["nidaqmx"]
+all = ["PyQt5", "matplotlib", "nidaqmx"]
+
+[project.scripts]
+auto-mhfr = "auto_mhfr.cli:main"
+
+[project.urls]
+Repository = "https://github.com/TakatoPhy/auto-mhfr"
+
+[tool.setuptools.packages.find]
+include = ["auto_mhfr*"]
