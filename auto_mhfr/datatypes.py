@@ -163,3 +163,12 @@ class LockStatus:
     pid_output: float
     mode_hop_detected: bool
     time_locked_s: float
+
+
+@dataclass
+class DriftRecord:
+    """Single record of a successful lock's optimal current."""
+    timestamp: float
+    channel_name: str
+    optimal_current_mA: float
+    target_freq_THz: float

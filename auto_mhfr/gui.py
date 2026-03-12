@@ -55,6 +55,7 @@ class WorkerSignals(QObject):
     scan_progress = pyqtSignal(str, str, float)  # channel, phase, progress
     lock_status = pyqtSignal(str, object)  # channel, LockStatus
     quick_check_done = pyqtSignal(dict)  # {name: {ok, error_MHz, ...}}
+    smart_rescan_done = pyqtSignal(dict)  # {name: {ok, ...}}
     error = pyqtSignal(str)
     log = pyqtSignal(str)
 
@@ -245,6 +246,7 @@ class MainWindow(QMainWindow):
         self.signals.scan_done.connect(self._on_scan_done)
         self.signals.lock_status.connect(self._on_lock_status)
         self.signals.quick_check_done.connect(self._on_quick_check_done)
+        self.signals.smart_rescan_done.connect(self._on_smart_rescan_done)
         self.signals.error.connect(self._on_error)
         self.signals.log.connect(self._on_log)
 
@@ -280,6 +282,14 @@ class MainWindow(QMainWindow):
         self.btn_quick.setEnabled(False)
         self.btn_quick.clicked.connect(self._on_quick_check_clicked)
         btn_layout.addWidget(self.btn_quick)
+
+        self.btn_smart = QPushButton("SMART RESCAN")
+        self.btn_smart.setFont(QFont("sans-serif", 16, QFont.Bold))
+        self.btn_smart.setMinimumHeight(60)
+        self.btn_smart.setStyleSheet("background-color: #e67e22; color: white;")
+        self.btn_smart.setEnabled(False)
+        self.btn_smart.clicked.connect(self._on_smart_rescan_clicked)
+        btn_layout.addWidget(self.btn_smart)
 
         self.btn_lock = QPushButton("LOCK")
         self.btn_lock.setFont(QFont("sans-serif", 16, QFont.Bold))
@@ -367,15 +377,17 @@ class MainWindow(QMainWindow):
 
     def _on_quick_check_done(self, results: dict):
         all_ok = True
+        self._shifted_channels = []
         for name, r in results.items():
             if r["ok"]:
                 self._log(f"{name}: OK (error={r['error_MHz']:+.1f} MHz)")
                 self.panels[name].status_label.setText("CHECK OK")
                 self.panels[name]._set_status_color("green")
             else:
-                self._log(f"{name}: SHIFTED ({r['reason']}, error={r['error_MHz']:+.1f} MHz) - rescan needed")
+                self._log(f"{name}: SHIFTED ({r['reason']}, error={r['error_MHz']:+.1f} MHz)")
                 self.panels[name].status_label.setText("SHIFTED")
                 self.panels[name]._set_status_color("yellow")
+                self._shifted_channels.append(name)
                 all_ok = False
 
         self.btn_quick.setEnabled(True)
@@ -383,7 +395,58 @@ class MainWindow(QMainWindow):
             self.btn_lock.setEnabled(True)
             self._log("All channels OK. Ready to lock.")
         else:
-            self._log("Some channels shifted. Run SCAN for those channels.")
+            self.btn_smart.setEnabled(True)
+            self._log(f"{len(self._shifted_channels)} channel(s) shifted. SMART RESCAN available.")
+
+    def _on_smart_rescan_clicked(self):
+        channels = getattr(self, "_shifted_channels", self.mgr.channel_names)
+        self.btn_smart.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        for name in channels:
+            self.panels[name].status_label.setText("SMART RESCAN...")
+            self.panels[name]._set_status_color("#e67e22")
+        self._log(f"Smart rescan: {', '.join(channels)}")
+
+        def worker():
+            try:
+                results = self.mgr.smart_rescan_all(channels=channels)
+                self.signals.smart_rescan_done.emit(results)
+            except Exception as e:
+                self.signals.error.emit(str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_smart_rescan_done(self, results: dict):
+        any_lockable = False
+        for name, r in results.items():
+            ch_cfg = next(c for c in self.config.channels if c.name == name)
+            cands = r["candidates"]
+            summary = self.mgr.get_summary(name)
+            result = self.mgr._results.get(name)
+
+            if summary:
+                self.panels[name].set_scan_result(summary, cands)
+            if result:
+                self.plots[name].plot_scan(result, ch_cfg.target_freq_THz, cands)
+
+            lo, hi = r["scan_range_mA"]
+            if r["ok"]:
+                margin = cands[0].min_margin_mA if cands else 0
+                fell_back = " (fell back to full)" if r["fell_back_to_full"] else ""
+                self._log(f"{name}: OK, scanned {lo:.1f}-{hi:.1f} mA, margin={margin:.2f} mA{fell_back}")
+                any_lockable = True
+            else:
+                self._log(f"{name}: NO SAFE POINT after smart rescan - adjust temperature")
+
+        self.btn_scan.setEnabled(True)
+        self.btn_quick.setEnabled(True)
+        self.btn_lock.setEnabled(any_lockable)
+        # Save updated profiles
+        try:
+            self.mgr.save_profiles(self.store)
+            self._log("Profiles saved.")
+        except Exception as e:
+            self._log(f"Warning: failed to save profiles: {e}")
 
     def _on_scan_clicked(self):
         self.btn_scan.setEnabled(False)

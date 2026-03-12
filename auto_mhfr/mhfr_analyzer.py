@@ -15,6 +15,7 @@ from .datatypes import (
     ScanSummary,
     LockCandidate,
     LockStatus,
+    DriftRecord,
 )
 from .config import ChannelConfig, SystemConfig
 from .wavemeter import WavemeterInterface, MockWavemeter
@@ -96,20 +97,26 @@ class MHFRScanner:
     def scan_bidirectional(
         self,
         progress_callback: Optional[Callable[[str, float], None]] = None,
+        override_range: Optional[tuple[float, float]] = None,
     ) -> ScanResult:
-        """Full up-then-down scan. Returns ScanResult with detected segments."""
+        """Full up-then-down scan. Returns ScanResult with detected segments.
+
+        If override_range is given, scan that range instead of the configured range.
+        """
         sc = self.cfg.scan
+        i_min = override_range[0] if override_range else sc.current_min_mA
+        i_max = override_range[1] if override_range else sc.current_max_mA
         t0 = time.time()
 
         # Move to start first
-        self.dac.set_current_mA(self.cfg.dac_channel, sc.current_min_mA)
+        self.dac.set_current_mA(self.cfg.dac_channel, i_min)
         time.sleep(sc.settle_time_s * 10)
 
         # Up sweep
-        logger.info("Starting UP sweep: %.2f -> %.2f mA", sc.current_min_mA, sc.current_max_mA)
+        logger.info("Starting UP sweep: %.2f -> %.2f mA", i_min, i_max)
         raw_up = self.scan_unidirectional(
-            sc.current_min_mA,
-            sc.current_max_mA,
+            i_min,
+            i_max,
             ScanDirection.UP,
             progress_callback=lambda p: progress_callback("UP", p)
             if progress_callback
@@ -117,10 +124,10 @@ class MHFRScanner:
         )
 
         # Down sweep (start from where we are)
-        logger.info("Starting DOWN sweep: %.2f -> %.2f mA", sc.current_max_mA, sc.current_min_mA)
+        logger.info("Starting DOWN sweep: %.2f -> %.2f mA", i_max, i_min)
         raw_down = self.scan_unidirectional(
-            sc.current_max_mA,
-            sc.current_min_mA,
+            i_max,
+            i_min,
             ScanDirection.DOWN,
             progress_callback=lambda p: progress_callback("DOWN", p)
             if progress_callback
@@ -136,7 +143,7 @@ class MHFRScanner:
             down_segments=down_segments,
             raw_up=raw_up,
             raw_down=raw_down,
-            scan_range_mA=(sc.current_min_mA, sc.current_max_mA),
+            scan_range_mA=(i_min, i_max),
             timestamp=t0,
         )
 
@@ -444,6 +451,62 @@ class SweetSpotFinder:
 
 
 # ---------------------------------------------------------------------------
+# 2b. DriftAnalyzer -- Predict scan range from historical drift
+# ---------------------------------------------------------------------------
+
+
+class DriftAnalyzer:
+    """Analyzes drift history to predict narrow scan range for smart rescan."""
+
+    @staticmethod
+    def predict_scan_range(
+        records: list[DriftRecord],
+        current_min_mA: float,
+        current_max_mA: float,
+        safety_factor: float = 2.0,
+        min_records: int = 3,
+        default_margin_mA: float = 2.0,
+    ) -> tuple[float, float, dict]:
+        """Predict a narrow scan range from drift history.
+
+        Returns (scan_min_mA, scan_max_mA, stats).
+        """
+        if len(records) < min_records:
+            # Not enough data -- use default margin around last known current
+            if records:
+                center = records[-1].optimal_current_mA
+            else:
+                center = (current_min_mA + current_max_mA) / 2.0
+            lo = max(center - default_margin_mA, current_min_mA)
+            hi = min(center + default_margin_mA, current_max_mA)
+            return lo, hi, {
+                "n_records": len(records),
+                "method": "default",
+                "margin_mA": default_margin_mA,
+            }
+
+        currents = np.array([r.optimal_current_mA for r in records])
+        latest = records[-1].optimal_current_mA
+        std = float(np.std(currents))
+        max_drift = float(np.max(np.abs(currents - latest)))
+
+        margin = max(std, max_drift) * safety_factor
+        margin = max(margin, 1.0)  # at least ±1 mA
+
+        lo = max(latest - margin, current_min_mA)
+        hi = min(latest + margin, current_max_mA)
+
+        return lo, hi, {
+            "n_records": len(records),
+            "method": "predicted",
+            "margin_mA": margin,
+            "std_mA": std,
+            "max_drift_mA": max_drift,
+            "center_mA": latest,
+        }
+
+
+# ---------------------------------------------------------------------------
 # 3. LaserLocker -- Approach + PID lock with mode hop detection
 # ---------------------------------------------------------------------------
 
@@ -720,6 +783,9 @@ class MultiChannelManager:
         self._summaries: dict[str, ScanSummary] = {}
         self._candidates: dict[str, list[LockCandidate]] = {}
 
+        from .storage import DriftHistory
+        self._drift_history = DriftHistory()
+
         for ch_cfg in config.channels:
             name = ch_cfg.name
             self._scanners[name] = MHFRScanner(wavemeter, dac, ch_cfg)
@@ -768,6 +834,14 @@ class MultiChannelManager:
                 candidates[0], summary=self._summaries.get(name)
             )
             results[name] = ok
+            if ok:
+                record = DriftRecord(
+                    timestamp=time.time(),
+                    channel_name=name,
+                    optimal_current_mA=candidates[0].optimal_current_mA,
+                    target_freq_THz=ch_cfg.target_freq_THz,
+                )
+                self._drift_history.append(record)
             logger.info("Lock %s: %s", name, "OK" if ok else "FAILED")
         return results
 
@@ -847,6 +921,96 @@ class MultiChannelManager:
         results = {}
         for ch_cfg in self.config.channels:
             results[ch_cfg.name] = self.quick_check(ch_cfg.name)
+        return results
+
+    def smart_rescan(
+        self,
+        name: str,
+        safety_factor: float = 2.0,
+        progress_callback: Optional[Callable[[str, float], None]] = None,
+    ) -> dict:
+        """Smart rescan: narrow scan based on drift history.
+
+        Returns dict with:
+            scan_range_mA: (lo, hi) actually scanned
+            candidates: list[LockCandidate]
+            ok: whether a safe candidate was found
+            fell_back_to_full: whether full scan was needed
+            stats: drift prediction stats
+        """
+        ch_cfg = next(c for c in self.config.channels if c.name == name)
+        records = self._drift_history.load(name)
+
+        lo, hi, stats = DriftAnalyzer.predict_scan_range(
+            records,
+            ch_cfg.scan.current_min_mA,
+            ch_cfg.scan.current_max_mA,
+            safety_factor=safety_factor,
+        )
+
+        logger.info(
+            "Smart rescan %s: %.2f-%.2f mA (%s, %d records)",
+            name, lo, hi, stats["method"], stats["n_records"],
+        )
+
+        # Narrow scan
+        result = self._scanners[name].scan_bidirectional(
+            progress_callback=progress_callback,
+            override_range=(lo, hi),
+        )
+        self._results[name] = result
+        self._summaries[name] = MHFRScanner.summarize(result)
+
+        candidates = self._finders[name].find_candidates(
+            result, ch_cfg.target_freq_THz
+        )
+        self._candidates[name] = candidates
+
+        if candidates:
+            logger.info(
+                "Smart rescan %s: found %d candidates (margin=%.2f mA)",
+                name, len(candidates), candidates[0].min_margin_mA,
+            )
+            return {
+                "scan_range_mA": (lo, hi),
+                "candidates": candidates,
+                "ok": True,
+                "fell_back_to_full": False,
+                "stats": stats,
+            }
+
+        # No candidates in narrow range -- fall back to full scan
+        logger.info("Smart rescan %s: no candidates in narrow range, falling back to full scan", name)
+        result = self._scanners[name].scan_bidirectional(
+            progress_callback=progress_callback,
+        )
+        self._results[name] = result
+        self._summaries[name] = MHFRScanner.summarize(result)
+
+        candidates = self._finders[name].find_candidates(
+            result, ch_cfg.target_freq_THz
+        )
+        self._candidates[name] = candidates
+
+        return {
+            "scan_range_mA": (ch_cfg.scan.current_min_mA, ch_cfg.scan.current_max_mA),
+            "candidates": candidates,
+            "ok": len(candidates) > 0,
+            "fell_back_to_full": True,
+            "stats": stats,
+        }
+
+    def smart_rescan_all(
+        self,
+        channels: Optional[list[str]] = None,
+        safety_factor: float = 2.0,
+    ) -> dict[str, dict]:
+        """Smart rescan for specified channels (or all)."""
+        if channels is None:
+            channels = self.channel_names
+        results = {}
+        for name in channels:
+            results[name] = self.smart_rescan(name, safety_factor=safety_factor)
         return results
 
     def load_profiles(self, store: "ProfileStore") -> list[str]:

@@ -13,6 +13,7 @@ from .datatypes import (
     ScanResult,
     ScanSummary,
     LockCandidate,
+    DriftRecord,
 )
 
 
@@ -192,3 +193,53 @@ class ProfileStore:
         path = self._path(name)
         if path.exists():
             path.unlink()
+
+
+class DriftHistory:
+    """Accumulates optimal current records over time for drift prediction."""
+
+    def __init__(self, directory: str = "~/.auto_mhfr"):
+        self.directory = Path(os.path.expanduser(directory))
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, channel_name: str) -> Path:
+        safe_name = channel_name.replace("/", "_").replace(" ", "_")
+        return self.directory / f"drift_{safe_name}.json"
+
+    def append(self, record: DriftRecord, max_entries: int = 100) -> None:
+        records = self.load(record.channel_name)
+        records.append(record)
+        # Keep only the most recent entries
+        if len(records) > max_entries:
+            records = records[-max_entries:]
+        self._save_all(record.channel_name, records)
+
+    def load(self, channel_name: str) -> list[DriftRecord]:
+        path = self._path(channel_name)
+        if not path.exists():
+            return []
+        with open(path) as f:
+            data = json.load(f)
+        return [
+            DriftRecord(
+                timestamp=d["timestamp"],
+                channel_name=d["channel_name"],
+                optimal_current_mA=d["optimal_current_mA"],
+                target_freq_THz=d["target_freq_THz"],
+            )
+            for d in data
+        ]
+
+    def _save_all(self, channel_name: str, records: list[DriftRecord]) -> None:
+        path = self._path(channel_name)
+        data = [
+            {
+                "timestamp": r.timestamp,
+                "channel_name": r.channel_name,
+                "optimal_current_mA": r.optimal_current_mA,
+                "target_freq_THz": r.target_freq_THz,
+            }
+            for r in records
+        ]
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)

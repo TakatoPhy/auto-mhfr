@@ -10,11 +10,13 @@ from .datatypes import (
     ScanSummary,
     LockCandidate,
     LockStatus,
+    DriftRecord,
 )
 from .config import SystemConfig, ScanConfig, PIDConfig, LockConfig, ChannelConfig
 from .mhfr_analyzer import (
     MHFRScanner,
     SweetSpotFinder,
+    DriftAnalyzer,
     LaserLocker,
     MultiChannelManager,
 )
